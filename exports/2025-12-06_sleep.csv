@@ -1,0 +1,2 @@
+row_id,sleep_score_1_day,date,sleep_duration,sleep_score,quality,sleep_score_factors,stress_avg,deep_sleep_duration,light_sleep_duration,rem_duration,awake_time,sleep_timeline_metrics,breathing_variations,restless_moments,avg_overnight_heart_rate,resting_heart_rate,body_battery_change,avg_sp_o2,lowest_sp_o2,avg_respiration,lowest_respiration,avg_overnight_hrv,x7d_avg_hrv
+1,NA,2025-12-06,7h 4m,48,Poor,NA,39,52m,5h 51m,21m,43m,NA,Minimal,37,57 bpm,50 bpm,+30,96%,90%,15 brpm,9 brpm,47 ms,Unbalanced

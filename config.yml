@@ -1,0 +1,8 @@
+default:
+  base_dir: !expr getwd()
+  data_dir: !expr file.path(getwd(), "data")
+  data_bck_dir: !expr file.path(getwd(), "data_bck")
+  exports_dir: !expr file.path(getwd(), "exports")
+  tmp_dir: !expr file.path(tempdir(), "notion_exports_tmp")
+  cleanup_old_zips: true
+  tz: !expr ifelse(is.na(Sys.timezone()), "UTC", Sys.timezone())
