@@ -271,14 +271,14 @@ process_weight_week <- function(path, exports_dir, tz) {
   weight_df <- load_weight_df(path, tz)
   if (is.null(weight_df)) return(invisible(FALSE))
 
-  week_start <- floor_date(today(tzone = tz), "week", week_start = 1)
-  week_end <- week_start + days(6)
+  end_date <- today(tzone = tz)
+  start_date <- end_date - days(13)
 
   weight_week <- weight_df |>
-    filter(date >= week_start, date <= week_end)
+    filter(date >= start_date, date <= end_date)
 
   if (nrow(weight_week) == 0) {
-    log_warn("No weight entries for current week found in Weight.csv.")
+    log_warn("No weight entries for the last two weeks found in Weight.csv.")
     return(invisible(FALSE))
   }
 
@@ -286,7 +286,7 @@ process_weight_week <- function(path, exports_dir, tz) {
     weight_week,
     file.path(
       exports_dir,
-      paste0(week_end, "_weight_weekly.csv")
+      paste0(end_date, "_weight_trend.csv")
     )
   )
 }
@@ -355,7 +355,9 @@ process_notion_exports <- function(config) {
     return(invisible(NULL))
   }
 
-  blocks <- blocks |> rename(date = start_date)
+  blocks <- blocks |>
+    select(-any_of("date")) |>
+    rename(date = start_date)
 
   sessions_week <- filter_this_week(sessions, config$tz)
   sessions_day <- sessions_week |> filter(date == today(tzone = config$tz))
@@ -381,9 +383,7 @@ process_notion_exports <- function(config) {
     )
   }
 
-  if (today(tzone = config$tz) == floor_date(today(tzone = config$tz), "week", week_start = 1) + days(6)) {
-    process_weight_week(file.path(config$data_dir, "Weight.csv"), config$exports_dir, config$tz)
-  }
+  process_weight_week(file.path(config$data_dir, "Weight.csv"), config$exports_dir, config$tz)
 
   schedule_csv <- list.files(
     config$tmp_dir,
@@ -415,6 +415,7 @@ process_notion_exports <- function(config) {
           )
 
         schedule_today <- schedule |> filter(schedule_date == today(tzone = config$tz))
+        schedule_today <- schedule_today |> select(-schedule_datetime, -schedule_date)
 
         write_export(
           schedule_today,
