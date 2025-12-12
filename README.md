@@ -12,7 +12,7 @@ A small data-staging repo for personal coaching data exported from Notion and Ga
   - `bike_outdoor.csv`
   - `swim_pool.csv`
   - `swim_ow.csv`
-- Download to the `data` folder the Healt reports `Sleep.csv` and `Weight.csv` from Garmin.
+- Download to the `data` folder the Health reports `Sleep.csv` and `Weight.csv` from Garmin.
 - Run the file `R/main.R` to read the raw export and write cleaned CSVs into `exports/`.
 
 ## Expected `data/` contents
@@ -26,6 +26,12 @@ A small data-staging repo for personal coaching data exported from Notion and Ga
 
 ## Other directories
 - `data_bck/`: archived raw exports plus ad-hoc CSV snapshots (Sleep.csv, run.csv, Weight.csv).
-- `exports/`: cleaned/aggregated outputs (sleep, run, weight, schedule, health_daily, training_sessions_daily) named with the export date.
+- `exports/`: cleaned/aggregated outputs named with the export date, including:
+  - `sleep_trend`: full sleep history table from `Sleep.csv` (one row per day, all metrics).
+  - `weight_trend`: full weight history from `Weight.csv` (no 2-week filter).
+  - `run`, `bike_*`, `swim_*`: cleaned lap/interval tables.
+  - `health_daily`: health metrics from the latest Notion export.
+  - `training_sessions_planned`: daily training plan for today.
+  - `schedule`: schedule entries for today.
 - `config.yml`: centralizes the data, backup, export, and temp directories.
 - `renv/`, `renv.lock`: R environment bootstrap and lockfile.

@@ -24,7 +24,6 @@ invisible(lapply(names(activity_specs), function(name) {
 
 # process sleep and weight csvs in data
 process_sleep(file.path(config$data_dir, "Sleep.csv"), config$exports_dir, config$tz)
-process_weight(file.path(config$data_dir, "Weight.csv"), config$exports_dir, config$tz)
 
 # backup data directory and reset to empty
 backup_and_reset_data(config$data_dir, config$data_bck_dir)
