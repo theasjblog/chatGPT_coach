@@ -4,6 +4,7 @@ library(stringr)
 library(lubridate)
 library(janitor)
 library(tidyr)
+library(jsonlite)
 library(config)
 
 source(file.path(getwd(), "R", "functions.R"))

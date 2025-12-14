@@ -1,6 +1,8 @@
 log_info <- function(...) message("[notion_exports] ", paste(..., collapse = " "))
 log_warn <- function(...) warning(paste0("[notion_exports] ", paste(..., collapse = " ")), call. = FALSE)
 
+`%||%` <- function(x, y) if (!is.null(x)) x else y
+
 ensure_dir <- function(path, clean = FALSE) {
   if (dir.exists(path) && clean) {
     unlink(path, recursive = TRUE, force = TRUE)
@@ -48,6 +50,24 @@ read_csv_clean <- function(path, col_types = NULL) {
       NULL
     }
   )
+}
+
+safe_mean <- function(x) {
+  m <- mean(x, na.rm = TRUE)
+  if (is.nan(m)) NA_real_ else m
+}
+
+safe_max <- function(x) {
+  m <- suppressWarnings(max(x, na.rm = TRUE))
+  if (!is.finite(m)) NA_real_ else m
+}
+
+safe_weighted_mean <- function(x, w) {
+  if (length(x) == 0 || length(w) == 0) return(NA_real_)
+  if (length(x) != length(w)) return(NA_real_)
+  mask <- !is.na(x) & !is.na(w) & w > 0
+  if (!any(mask)) return(NA_real_)
+  sum(x[mask] * w[mask], na.rm = TRUE) / sum(w[mask], na.rm = TRUE)
 }
 
 seconds_from_time_like_scalar <- function(x) {
@@ -113,12 +133,14 @@ normalize_time_like <- function(x) {
 drop_run_summary_rows <- function(df) {
   if (!"laps" %in% names(df)) return(df)
 
+  lap_pattern <- "^\\d+(?:\\.\\d+)?(?:\\s*-\\s*\\d+(?:\\.\\d+)?)?$"
+
   df |>
     mutate(laps = as.character(laps)) |>
     filter(
       !is.na(laps),
       !laps %in% c("Summary", "Lap Summary"),
-      stringr::str_detect(laps, "^\\d+(\\.\\d+)?$")
+      stringr::str_detect(laps, lap_pattern)
     )
 }
 
@@ -162,6 +184,7 @@ load_run_activity <- function(path, columns) {
   }
 
   time_cols <- intersect(c("time", "avg_pace_min_km", "avg_gap_min_km"), names(raw))
+  lap_pattern <- "^\\d+(?:\\.\\d+)?(?:\\s*-\\s*\\d+(?:\\.\\d+)?)?$"
 
   # drop empty placeholder column if present
   raw <- raw |>
@@ -172,7 +195,7 @@ load_run_activity <- function(path, columns) {
   run_aligned <- raw |>
     mutate(
       lap_num = dplyr::coalesce(
-        if_else(stringr::str_detect(lap, "^\\d+$"), lap, NA_character_),
+        if_else(stringr::str_detect(lap, lap_pattern), lap, NA_character_),
         if_else(stringr::str_detect(step_type, "^\\d+$"), step_type, NA_character_)
       ),
       shifted = stringr::str_detect(step_type, "^\\d+$") &
@@ -209,6 +232,317 @@ load_run_activity <- function(path, columns) {
   }
 
   run_aligned
+}
+
+summarise_run_interval <- function(samples, start_sec, stop_sec) {
+  interval_samples <- samples |>
+    filter(secs >= start_sec, secs <= stop_sec)
+
+  if (nrow(interval_samples) < 2) return(NULL)
+
+  interval_samples <- interval_samples |>
+    arrange(secs) |>
+    mutate(
+      lead_secs = lead(secs),
+      lead_km = lead(km),
+      delta_secs = pmax(lead_secs - secs, 0),
+      delta_km = lead_km - km
+    )
+
+  moving_rows <- interval_samples$delta_secs > 0 & interval_samples$delta_km > 0
+
+  if (!any(moving_rows)) return(NULL)
+
+  moving_weights <- ifelse(moving_rows, interval_samples$delta_secs, 0)
+
+  moving_time <- sum(interval_samples$delta_secs[moving_rows], na.rm = TRUE)
+  moving_distance <- sum(interval_samples$delta_km[moving_rows], na.rm = TRUE)
+  if (!is.finite(moving_distance) || moving_distance <= 0) return(NULL)
+
+  pace_sec_per_km <- moving_time / moving_distance
+
+  cadence_spm <- interval_samples$rcad * 2
+  speed_mps <- ifelse(interval_samples$delta_secs > 0,
+    (interval_samples$delta_km * 1000) / interval_samples$delta_secs,
+    NA_real_
+  )
+  stride_length <- ifelse(cadence_spm > 0, speed_mps / (cadence_spm / 60), NA_real_)
+  vertical_ratio <- ifelse(stride_length > 0, (interval_samples$rvert / 100) / stride_length * 100, NA_real_)
+
+  alt_diff <- diff(interval_samples$alt)
+  moving_steps <- moving_rows[-length(moving_rows)]
+  total_ascent <- sum(pmax(alt_diff[moving_steps], 0), na.rm = TRUE)
+
+  tibble(
+    time = format_mm_ss(moving_time),
+    distance_km = round(moving_distance, 2),
+    avg_pace_min_km = format_mm_ss(pace_sec_per_km),
+    avg_gap_min_km = format_mm_ss(pace_sec_per_km),
+    avg_hr_bpm = round(safe_weighted_mean(interval_samples$hr, moving_weights)),
+    max_hr_bpm = safe_max(interval_samples$hr[moving_rows, drop = TRUE]),
+    total_ascent_m = round(total_ascent, 1),
+    avg_power_w = round(safe_weighted_mean(interval_samples$watts, moving_weights)),
+    max_power_w = safe_max(interval_samples$watts[moving_rows, drop = TRUE]),
+    avg_run_cadence_spm = round(safe_weighted_mean(cadence_spm, moving_weights), 1),
+    avg_ground_contact_time_ms = round(safe_weighted_mean(interval_samples$rcon, moving_weights), 1),
+    avg_stride_length_m = round(safe_weighted_mean(stride_length, moving_weights), 3),
+    avg_vertical_oscillation_cm = round(safe_weighted_mean(interval_samples$rvert, moving_weights), 2),
+    avg_vertical_ratio_percent = round(safe_weighted_mean(vertical_ratio, moving_weights), 2)
+  )
+}
+
+compute_normalized_power <- function(power_vec, window = 30) {
+  power_vec <- power_vec[is.finite(power_vec)]
+  if (length(power_vec) < window) return(NA_real_)
+
+  cums <- c(0, cumsum(power_vec))
+  rolling_means <- (cums[(window + 1):length(cums)] - cums[seq_len(length(cums) - window)]) / window
+  (mean(rolling_means^4))^(1 / 4)
+}
+
+compute_arc_length <- function(start, end) {
+  if (length(start) == 0 || length(end) == 0) return(numeric(0))
+  (end - start) %% 360
+}
+
+summarise_bike_interval <- function(samples, start_sec, stop_sec) {
+  interval_samples <- samples |>
+    filter(secs >= start_sec, secs <= stop_sec) |>
+    arrange(secs) |>
+    mutate(
+      lead_secs = lead(secs),
+      delta_secs = lead_secs - secs
+    )
+
+  interval_samples <- interval_samples |>
+    mutate(delta_secs = ifelse(is.na(delta_secs) | delta_secs < 0, 0, delta_secs))
+
+  if (nrow(interval_samples) < 2) return(NULL)
+
+  moving_rows <- interval_samples$delta_secs > 0 &
+    coalesce(interval_samples$watts, 0) > 0 &
+    coalesce(interval_samples$kph, 0) > 0
+  moving_rows[is.na(moving_rows)] <- FALSE
+
+  if (!any(moving_rows, na.rm = TRUE)) return(NULL)
+
+  moving_weights <- ifelse(moving_rows, interval_samples$delta_secs, 0)
+
+  moving_time <- sum(interval_samples$delta_secs[moving_rows], na.rm = TRUE)
+  if (!is.finite(moving_time) || moving_time <= 0) return(NULL)
+
+  moving_powers <- interval_samples$watts[moving_rows]
+  moving_times <- interval_samples$delta_secs[moving_rows]
+  valid_np <- is.finite(moving_powers) & is.finite(moving_times) & moving_times > 0
+  moving_power_rep <- if (any(valid_np)) {
+    rep(
+      moving_powers[valid_np],
+      times = pmax(1L, as.integer(round(moving_times[valid_np])))
+    )
+  } else {
+    numeric(0)
+  }
+
+  avg_power <- round(safe_weighted_mean(interval_samples$watts, moving_weights))
+  max_power <- safe_max(interval_samples$watts[moving_rows, drop = TRUE])
+  norm_power <- round(compute_normalized_power(moving_power_rep))
+
+  avg_hr <- round(safe_weighted_mean(interval_samples$hr, moving_weights))
+  max_hr <- safe_max(interval_samples$hr[moving_rows, drop = TRUE])
+  avg_cadence <- round(safe_weighted_mean(interval_samples$cad, moving_weights), 1)
+
+  left_balance <- round(safe_weighted_mean(interval_samples$lrbalance, moving_weights), 1)
+  right_balance <- ifelse(is.na(left_balance), NA_real_, round(100 - left_balance, 1))
+
+  pp_start_l <- safe_weighted_mean(interval_samples$lppb, moving_weights)
+  pp_end_l <- safe_weighted_mean(interval_samples$lppe, moving_weights)
+  pp_start_r <- safe_weighted_mean(interval_samples$rppb, moving_weights)
+  pp_end_r <- safe_weighted_mean(interval_samples$rppe, moving_weights)
+  pp_arc_l <- safe_weighted_mean(compute_arc_length(interval_samples$lppb, interval_samples$lppe), moving_weights)
+  pp_arc_r <- safe_weighted_mean(compute_arc_length(interval_samples$rppb, interval_samples$rppe), moving_weights)
+
+  peak_start_l <- safe_weighted_mean(interval_samples$lpppb, moving_weights)
+  peak_end_l <- safe_weighted_mean(interval_samples$lpppe, moving_weights)
+  peak_start_r <- safe_weighted_mean(interval_samples$rpppb, moving_weights)
+  peak_end_r <- safe_weighted_mean(interval_samples$rpppe, moving_weights)
+  peak_arc_l <- safe_weighted_mean(compute_arc_length(interval_samples$lpppb, interval_samples$lpppe), moving_weights)
+  peak_arc_r <- safe_weighted_mean(compute_arc_length(interval_samples$rpppb, interval_samples$rpppe), moving_weights)
+
+  tibble(
+    time = format_mm_ss(moving_time),
+    avg_hr = avg_hr,
+    max_hr = max_hr,
+    avg_bike_cadence = avg_cadence,
+    normalized_power_r_np_r = norm_power,
+    balance_left_percent = left_balance,
+    balance_right_percent = right_balance,
+    torque_effectiveness_left_percent = NA_real_,
+    torque_effectiveness_right_percent = NA_real_,
+    pedal_smoothness_left_percent = NA_real_,
+    pedal_smoothness_right_percent = NA_real_,
+    avg_power = avg_power,
+    max_power = max_power,
+    l_power_phase_start_angle = round(pp_start_l, 1),
+    l_power_phase_end_angle = round(pp_end_l, 1),
+    r_power_phase_start_angle = round(pp_start_r, 1),
+    r_power_phase_end_angle = round(pp_end_r, 1),
+    l_power_phase_arc_length = round(pp_arc_l, 1),
+    r_power_phase_arc_length = round(pp_arc_r, 1),
+    l_peak_power_phase_start_angle = round(peak_start_l, 1),
+    l_peak_power_phase_end_angle = round(peak_end_l, 1),
+    r_peak_power_phase_start_angle = round(peak_start_r, 1),
+    r_peak_power_phase_end_angle = round(peak_end_r, 1),
+    l_peak_power_phase_arc_length = round(peak_arc_l, 1),
+    r_peak_power_phase_arc_length = round(peak_arc_r, 1)
+  )
+}
+
+load_run_activity_json <- function(paths, columns) {
+  if (length(paths) == 0) return(NULL)
+
+  ordered <- paths[order(file.info(paths)$mtime, decreasing = TRUE)]
+
+  for (path in ordered) {
+    json_obj <- tryCatch(
+      jsonlite::fromJSON(readr::read_file(path)),
+      error = function(e) {
+        log_warn("Failed to parse run JSON", basename(path), ":", e$message)
+        NULL
+      }
+    )
+    if (is.null(json_obj)) next
+
+    ride <- json_obj$RIDE %||% json_obj$ride
+    if (is.null(ride)) next
+
+    sport <- ride$TAGS$Sport %||% ride$tags$sport
+    sport <- stringr::str_to_lower(stringr::str_trim(sport %||% ""))
+    if (!identical(sport, "run")) next
+
+    intervals_raw <- ride$INTERVALS %||% ride$intervals
+    samples_raw <- ride$SAMPLES %||% ride$samples
+
+    if (is.null(intervals_raw) || is.null(samples_raw)) {
+      log_warn("Run JSON missing INTERVALS or SAMPLES; skipping", basename(path))
+      next
+    }
+
+    intervals <- as_tibble(intervals_raw) |> janitor::clean_names()
+    samples <- as_tibble(samples_raw) |> janitor::clean_names()
+
+    if (!all(c("secs", "km") %in% names(samples))) {
+      log_warn("Run JSON missing expected sample fields; skipping", basename(path))
+      next
+    }
+
+    # ensure numeric where possible
+    num_cols <- intersect(
+      c("secs", "km", "watts", "kph", "hr", "alt", "rcad", "rvert", "rcon"),
+      names(samples)
+    )
+    samples <- samples |> mutate(across(all_of(num_cols), as.numeric))
+
+    summaries <- lapply(seq_len(nrow(intervals)), function(i) {
+      int <- intervals[i, ]
+      start_sec <- int$start
+      stop_sec <- int$stop
+      res <- summarise_run_interval(samples, start_sec, stop_sec)
+      if (is.null(res)) return(NULL)
+      res$laps <- as.character(i)
+      res
+    })
+
+    summaries <- bind_rows(summaries)
+    if (nrow(summaries) == 0) {
+      log_warn("Run JSON parsed but no interval summaries created:", basename(path))
+      next
+    }
+
+    # ensure column order and names align with expectations
+    summaries <- summaries |> select(any_of(columns))
+
+    return(summaries)
+  }
+
+  log_warn("No Run sport JSON files parsed successfully.")
+  NULL
+}
+
+load_bike_indoor_activity_json <- function(paths, columns) {
+  if (length(paths) == 0) return(NULL)
+
+  ordered <- paths[order(file.info(paths)$mtime, decreasing = TRUE)]
+
+  for (path in ordered) {
+    json_obj <- tryCatch(
+      jsonlite::fromJSON(readr::read_file(path)),
+      error = function(e) {
+        log_warn("Failed to parse bike JSON", basename(path), ":", e$message)
+        NULL
+      }
+    )
+    if (is.null(json_obj)) next
+
+    ride <- json_obj$RIDE %||% json_obj$ride
+    if (is.null(ride)) next
+
+    tags <- ride$TAGS %||% ride$tags
+    sport <- tags$Sport %||% tags$sport
+    subsport <- tags$SubSport %||% tags$subSport %||% tags$subsport
+
+    sport <- stringr::str_to_lower(stringr::str_trim(sport %||% ""))
+    subsport <- stringr::str_to_lower(stringr::str_trim(subsport %||% ""))
+
+    if (!(identical(sport, "bike") && identical(subsport, "turbo_trainer"))) next
+
+    intervals_raw <- ride$INTERVALS %||% ride$intervals
+    samples_raw <- ride$SAMPLES %||% ride$samples
+
+    if (is.null(intervals_raw) || is.null(samples_raw)) {
+      log_warn("Bike indoor JSON missing INTERVALS or SAMPLES; skipping", basename(path))
+      next
+    }
+
+    intervals <- as_tibble(intervals_raw) |> janitor::clean_names()
+    samples <- as_tibble(samples_raw) |> janitor::clean_names()
+
+    if (!"secs" %in% names(samples) || !"watts" %in% names(samples)) {
+      log_warn("Bike indoor JSON missing expected sample fields; skipping", basename(path))
+      next
+    }
+
+    num_cols <- intersect(
+      c(
+        "secs", "km", "watts", "cad", "kph", "hr", "alt", "slope", "temp",
+        "lrbalance", "lppb", "rppb", "lppe", "rppe",
+        "lpppb", "rpppb", "lpppe", "rpppe"
+      ),
+      names(samples)
+    )
+    samples <- samples |> mutate(across(all_of(num_cols), as.numeric))
+
+    summaries <- lapply(seq_len(nrow(intervals)), function(i) {
+      int <- intervals[i, ]
+      start_sec <- int$start
+      stop_sec <- int$stop
+      res <- summarise_bike_interval(samples, start_sec, stop_sec)
+      if (is.null(res)) return(NULL)
+      res$laps <- stringr::str_trim(int$name %||% as.character(i))
+      res
+    })
+
+    summaries <- bind_rows(summaries)
+    if (nrow(summaries) == 0) {
+      log_warn("Bike indoor JSON parsed but no interval summaries created:", basename(path))
+      next
+    }
+
+    summaries <- summaries |> select(any_of(columns))
+    return(summaries)
+  }
+
+  log_warn("No Bike turbo_trainer JSON files parsed successfully.")
+  NULL
 }
 
 select_expected_csvs <- function(csvs) {
@@ -386,24 +720,46 @@ process_weight <- function(path, exports_dir, tz) {
 }
 
 process_activity <- function(name, pattern, columns, config) {
-  files <- list.files(config$data_dir, pattern = "\\.csv$", full.names = TRUE)
-  files <- files[stringr::str_detect(basename(files), pattern)]
+  df <- NULL
 
-  if (length(files) == 0) {
-    log_warn("No", name, "CSV found in data.")
-    return(invisible(FALSE))
-  }
-  if (length(files) > 1) {
-    log_warn("Multiple", name, "CSVs found; using the most recent by modified time.")
-  }
-
-  path <- latest_file(files, config$tz)
-  df <- if (identical(name, "run")) {
-    load_run_activity(path, columns)
+  if (identical(name, "run")) {
+    json_paths <- list.files(config$data_dir, pattern = "\\.json$", full.names = TRUE)
+    if (length(json_paths) == 0) {
+      log_warn("No run JSON found in data; skipping.")
+      return(invisible(FALSE))
+    }
+    df <- load_run_activity_json(json_paths, columns)
+    if (is.null(df)) {
+      log_warn("Run JSON parsing failed; skipping run export.")
+      return(invisible(FALSE))
+    }
+  } else if (identical(name, "bike_indoor")) {
+    json_paths <- list.files(config$data_dir, pattern = "\\.json$", full.names = TRUE)
+    if (length(json_paths) == 0) {
+      log_warn("No bike indoor JSON found in data; skipping.")
+      return(invisible(FALSE))
+    }
+    df <- load_bike_indoor_activity_json(json_paths, columns)
+    if (is.null(df)) {
+      log_warn("Bike indoor JSON parsing failed; skipping bike_indoor export.")
+      return(invisible(FALSE))
+    }
   } else {
-    read_csv_clean(path)
+    files <- list.files(config$data_dir, pattern = "\\.csv$", full.names = TRUE)
+    files <- files[stringr::str_detect(basename(files), pattern)]
+
+    if (length(files) == 0) {
+      log_warn("No", name, "CSV found in data.")
+      return(invisible(FALSE))
+    }
+    if (length(files) > 1) {
+      log_warn("Multiple", name, "CSVs found; using the most recent by modified time.")
+    }
+
+    path <- latest_file(files, config$tz)
+    df <- read_csv_clean(path)
+    if (is.null(df)) return(invisible(FALSE))
   }
-  if (is.null(df)) return(invisible(FALSE))
 
   if (!identical(name, "run")) {
     df <- df |> select(any_of(columns))
@@ -415,6 +771,7 @@ process_activity <- function(name, pattern, columns, config) {
   if ("swim_stroke" %in% names(df)) {
     df <- df |> filter(swim_stroke != "--")
   }
+  df <- df |> select(where(~ !all(is.na(.x))))
 
   out_path <- file.path(
     config$exports_dir,
