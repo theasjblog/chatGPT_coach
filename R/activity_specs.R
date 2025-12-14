@@ -67,7 +67,7 @@ activity_specs <- list(
   swim_pool = list(
     pattern = "swim_pool",
     columns = c(
-      "intervals", "swim_stroke", "lengths",
+      "intervals", "interval_type", "swim_stroke", "lengths",
       "distance", "time", "avg_pace",
       "best_pace",
       "avg_swolf", "avg_hr", "max_hr",

@@ -397,6 +397,113 @@ summarise_bike_interval <- function(samples, start_sec, stop_sec) {
   )
 }
 
+summarise_swim_pool_interval <- function(samples, start_sec, stop_sec, pool_length_m = 25) {
+  interval_samples <- samples |>
+    filter(secs >= start_sec, secs <= stop_sec) |>
+    arrange(secs) |>
+    mutate(
+      lead_secs = lead(secs),
+      lead_km = lead(km),
+      delta_secs = lead_secs - secs,
+      delta_km = lead_km - km
+    )
+
+  interval_samples <- interval_samples |>
+    mutate(
+      delta_secs = ifelse(is.na(delta_secs) | delta_secs < 0, 0, delta_secs),
+      delta_km = ifelse(is.na(delta_km) | delta_km < 0, 0, delta_km)
+    )
+
+  if (nrow(interval_samples) < 2) return(NULL)
+
+  interval_duration <- if (is.finite(start_sec) && is.finite(stop_sec)) {
+    max(stop_sec - start_sec, 0)
+  } else {
+    interval_samples$secs[nrow(interval_samples)] - interval_samples$secs[1]
+  }
+
+  moving_rows <- interval_samples$delta_secs > 0 & interval_samples$delta_km > 0
+  moving_rows[is.na(moving_rows)] <- FALSE
+
+  if (!any(moving_rows)) {
+    avg_hr_rest <- round(safe_weighted_mean(interval_samples$hr, rep(1, nrow(interval_samples))))
+    max_hr_rest <- safe_max(interval_samples$hr)
+
+    return(tibble(
+      time = format_mm_ss(interval_duration),
+      lengths = 0,
+      distance = 0,
+      avg_pace = NA_character_,
+      best_pace = NA_character_,
+      avg_swolf = NA_real_,
+      avg_hr = avg_hr_rest,
+      max_hr = max_hr_rest,
+      total_strokes = 0,
+      avg_strokes = 0,
+      swim_stroke = NA_character_,
+      interval_type = "rest"
+    ))
+  }
+
+  moving_time <- sum(interval_samples$delta_secs[moving_rows], na.rm = TRUE)
+  distance_m <- sum(interval_samples$delta_km[moving_rows], na.rm = TRUE) * 1000
+  if (!is.finite(distance_m) || distance_m <= 0) {
+    return(tibble(
+      time = format_mm_ss(interval_duration),
+      lengths = 0,
+      distance = 0,
+      avg_pace = NA_character_,
+      best_pace = NA_character_,
+      avg_swolf = NA_real_,
+      avg_hr = round(safe_weighted_mean(interval_samples$hr, rep(1, nrow(interval_samples)))),
+      max_hr = safe_max(interval_samples$hr),
+      total_strokes = 0,
+      avg_strokes = 0,
+      swim_stroke = NA_character_,
+      interval_type = "rest"
+    ))
+  }
+
+  lengths <- distance_m / pool_length_m
+  pace_sec_per_100m <- moving_time / distance_m * 100
+
+  pace_per_100m_samples <- interval_samples$delta_secs[moving_rows] /
+    (interval_samples$delta_km[moving_rows] * 1000) * 100
+
+  best_pace <- min(pace_per_100m_samples[is.finite(pace_per_100m_samples)], na.rm = TRUE)
+  if (!is.finite(best_pace)) best_pace <- NA_real_
+
+  weights <- ifelse(moving_rows, interval_samples$delta_secs, 0)
+  avg_hr <- round(safe_weighted_mean(interval_samples$hr, weights))
+  max_hr <- safe_max(interval_samples$hr[moving_rows, drop = TRUE])
+
+  stroke_rate <- interval_samples$cad
+  total_strokes <- sum(stroke_rate[moving_rows] * interval_samples$delta_secs[moving_rows] / 60, na.rm = TRUE)
+  avg_strokes_per_length <- ifelse(lengths > 0, total_strokes / lengths, NA_real_)
+  avg_swolf <- ifelse(lengths > 0, moving_time / lengths + avg_strokes_per_length, NA_real_)
+
+  interval_type <- if (distance_m > 0 && (!is.finite(total_strokes) || total_strokes <= 0)) {
+    "drill"
+  } else {
+    "freestyle"
+  }
+
+  tibble(
+    time = format_mm_ss(moving_time),
+    lengths = round(lengths, 1),
+    distance = round(distance_m, 1),
+    avg_pace = format_mm_ss(pace_sec_per_100m),
+    best_pace = format_mm_ss(best_pace),
+    avg_swolf = round(avg_swolf, 1),
+    avg_hr = avg_hr,
+    max_hr = max_hr,
+    total_strokes = round(total_strokes, 1),
+    avg_strokes = round(avg_strokes_per_length, 1),
+    swim_stroke = NA_character_,
+    interval_type = interval_type
+  )
+}
+
 load_run_activity_json <- function(paths, columns) {
   if (length(paths) == 0) return(NULL)
 
@@ -542,6 +649,78 @@ load_bike_indoor_activity_json <- function(paths, columns) {
   }
 
   log_warn("No Bike turbo_trainer JSON files parsed successfully.")
+  NULL
+}
+
+load_swim_pool_activity_json <- function(paths, columns) {
+  if (length(paths) == 0) return(NULL)
+
+  ordered <- paths[order(file.info(paths)$mtime, decreasing = TRUE)]
+
+  for (path in ordered) {
+    json_obj <- tryCatch(
+      jsonlite::fromJSON(readr::read_file(path)),
+      error = function(e) {
+        log_warn("Failed to parse swim JSON", basename(path), ":", e$message)
+        NULL
+      }
+    )
+    if (is.null(json_obj)) next
+
+    ride <- json_obj$RIDE %||% json_obj$ride
+    if (is.null(ride)) next
+
+    tags <- ride$TAGS %||% ride$tags
+    sport <- tags$Sport %||% tags$sport
+    subsport <- tags$SubSport %||% tags$subSport %||% tags$subsport
+
+    sport <- stringr::str_to_lower(stringr::str_trim(sport %||% ""))
+    subsport <- stringr::str_to_lower(stringr::str_trim(subsport %||% ""))
+
+    if (!(identical(sport, "swim") && identical(subsport, "lap swimming"))) next
+
+    pool_len <- tags$`Pool Length` %||% tags$pool_length %||% tags$poolLength
+    pool_len <- suppressWarnings(as.numeric(stringr::str_trim(pool_len %||% "25")))
+    if (!is.finite(pool_len) || pool_len <= 0) pool_len <- 25
+
+    intervals_raw <- ride$INTERVALS %||% ride$intervals
+    samples_raw <- ride$SAMPLES %||% ride$samples
+
+    if (is.null(intervals_raw) || is.null(samples_raw)) {
+      log_warn("Swim pool JSON missing INTERVALS or SAMPLES; skipping", basename(path))
+      next
+    }
+
+    intervals <- as_tibble(intervals_raw) |> janitor::clean_names()
+    samples <- as_tibble(samples_raw) |> janitor::clean_names()
+
+    if (!all(c("secs", "km") %in% names(samples))) {
+      log_warn("Swim pool JSON missing expected sample fields; skipping", basename(path))
+      next
+    }
+
+    num_cols <- intersect(c("secs", "km", "cad", "kph", "hr"), names(samples))
+    samples <- samples |> mutate(across(all_of(num_cols), as.numeric))
+
+    summaries <- lapply(seq_len(nrow(intervals)), function(i) {
+      int <- intervals[i, ]
+      res <- summarise_swim_pool_interval(samples, int$start, int$stop, pool_len)
+      if (is.null(res)) return(NULL)
+      res$intervals <- stringr::str_trim(int$name %||% as.character(i))
+      res
+    })
+
+    summaries <- bind_rows(summaries)
+    if (nrow(summaries) == 0) {
+      log_warn("Swim pool JSON parsed but no interval summaries created:", basename(path))
+      next
+    }
+
+    summaries <- summaries |> select(any_of(columns))
+    return(summaries)
+  }
+
+  log_warn("No Swim lap swimming JSON files parsed successfully.")
   NULL
 }
 
@@ -725,23 +904,34 @@ process_activity <- function(name, pattern, columns, config) {
   if (identical(name, "run")) {
     json_paths <- list.files(config$data_dir, pattern = "\\.json$", full.names = TRUE)
     if (length(json_paths) == 0) {
-      log_warn("No run JSON found in data; skipping.")
+      log_info("Run JSON not provided; skipping export.")
       return(invisible(FALSE))
     }
     df <- load_run_activity_json(json_paths, columns)
     if (is.null(df)) {
-      log_warn("Run JSON parsing failed; skipping run export.")
+      log_warn("Run JSON found but parsing failed; skipping run export.")
       return(invisible(FALSE))
     }
   } else if (identical(name, "bike_indoor")) {
     json_paths <- list.files(config$data_dir, pattern = "\\.json$", full.names = TRUE)
     if (length(json_paths) == 0) {
-      log_warn("No bike indoor JSON found in data; skipping.")
+      log_info("Bike indoor JSON not provided; skipping export.")
       return(invisible(FALSE))
     }
     df <- load_bike_indoor_activity_json(json_paths, columns)
     if (is.null(df)) {
-      log_warn("Bike indoor JSON parsing failed; skipping bike_indoor export.")
+      log_warn("Bike indoor JSON found but parsing failed; skipping bike_indoor export.")
+      return(invisible(FALSE))
+    }
+  } else if (identical(name, "swim_pool")) {
+    json_paths <- list.files(config$data_dir, pattern = "\\.json$", full.names = TRUE)
+    if (length(json_paths) == 0) {
+      log_info("Swim pool JSON not provided; skipping export.")
+      return(invisible(FALSE))
+    }
+    df <- load_swim_pool_activity_json(json_paths, columns)
+    if (is.null(df)) {
+      log_warn("Swim pool JSON found but parsing failed; skipping swim_pool export.")
       return(invisible(FALSE))
     }
   } else {
@@ -749,7 +939,7 @@ process_activity <- function(name, pattern, columns, config) {
     files <- files[stringr::str_detect(basename(files), pattern)]
 
     if (length(files) == 0) {
-      log_warn("No", name, "CSV found in data.")
+      log_info("No", name, "CSV provided; skipping export.")
       return(invisible(FALSE))
     }
     if (length(files) > 1) {
@@ -769,7 +959,7 @@ process_activity <- function(name, pattern, columns, config) {
     df <- df |> filter(laps != "Summary")
   }
   if ("swim_stroke" %in% names(df)) {
-    df <- df |> filter(swim_stroke != "--")
+    df <- df |> filter(is.na(swim_stroke) | swim_stroke != "--")
   }
   df <- df |> select(where(~ !all(is.na(.x))))
 

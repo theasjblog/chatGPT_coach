@@ -6,12 +6,11 @@ A small data-staging repo for personal coaching data exported from Notion and Ga
 - Clone the repo
 - Run `renv::restore()` once to install the pinned packages.
 - Download your latest Notion export and drop the raw zip into `data/`. Do not unzip it.
-- Download to the `data` folder the activity splits csv from Garmin. Rename it as one of:
-  - `run.csv`
-  - `bike_indoor.csv`
-  - `bike_outdoor.csv`
-  - `swim_pool.csv`
-  - `swim_ow.csv`
+- Drop Garmin activity JSON files (as exported by GoldenCheetah) into `data/`. They are auto-detected by Sport/SubSport:
+  - Run (Sport=`Run`) — intervals in INTERVALS / samples in SAMPLES.
+  - Bike indoor (Sport=`Bike`, SubSport=`turbo_trainer`).
+  - Swim pool (Sport=`Swim`, SubSport=`lap swimming`) with rest/drill/freestyle interval typing.
+- For bike_outdoor and swim_ow you can still provide the legacy split CSVs in `data/` (`bike_outdoor.csv`, `swim_ow.csv`).
 - Download to the `data` folder the Health reports `Sleep.csv` and `Weight.csv` from Garmin.
 - Run the file `R/main.R` to read the raw export and write cleaned CSVs into `exports/`.
 
@@ -29,7 +28,7 @@ A small data-staging repo for personal coaching data exported from Notion and Ga
 - `exports/`: cleaned/aggregated outputs named with the export date, including:
   - `sleep_trend`: full sleep history table from `Sleep.csv` (one row per day, all metrics).
   - `weight_trend`: full weight history from `Weight.csv` (no 2-week filter).
-  - `run`, `bike_*`, `swim_*`: cleaned lap/interval tables.
+  - `run`, `bike_*`, `swim_*`: cleaned lap/interval tables (run/bike_indoor/swim_pool from JSON; bike_outdoor/swim_ow still accept CSV).
   - `health_daily`: health metrics from the latest Notion export.
   - `training_sessions_planned`: daily training plan for today.
   - `schedule`: schedule entries for today.
