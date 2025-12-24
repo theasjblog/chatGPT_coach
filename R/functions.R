@@ -726,9 +726,9 @@ load_swim_pool_activity_json <- function(paths, columns) {
 
 select_expected_csvs <- function(csvs) {
   patterns <- c(
-    health = "Health",
-    sessions = "daily",
-    blocks = "weekly"
+    health = "(?i)health",
+    sessions = "(?i)daily plan|daily",
+    blocks = "(?i)schedule|weekly"
   )
   lapply(patterns, function(pat) {
     match <- csvs[stringr::str_detect(csvs, pat)]
@@ -1041,7 +1041,7 @@ process_notion_exports <- function(config) {
   selected_csvs <- select_expected_csvs(all_csvs)
 
   if (any(vapply(selected_csvs, is.null, logical(1)))) {
-    log_warn("Missing expected _all.csv files; skipping exports.")
+    log_warn("Missing expected _all.csv files (health, daily plan, schedule); skipping exports.")
     return(invisible(NULL))
   }
 
@@ -1054,9 +1054,15 @@ process_notion_exports <- function(config) {
     return(invisible(NULL))
   }
 
-  blocks <- blocks |>
-    select(-any_of("date")) |>
-    rename(date = start_date)
+  if (!any(c("start_date", "date") %in% names(blocks))) {
+    log_warn("Blocks (schedule) file missing a date column; skipping blocks parsing.")
+    blocks <- tibble()
+  } else {
+    blocks <- blocks |>
+      rename_with(~ "date", any_of(c("start_date", "date"))) |>
+      mutate(date = parse_date_flex(date, config$tz)) |>
+      filter(!is.na(date))
+  }
 
   sessions_week <- filter_this_week(sessions, config$tz)
   sessions_day <- sessions_week |> filter(date == today(tzone = config$tz))
